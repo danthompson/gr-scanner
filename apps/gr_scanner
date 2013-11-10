@@ -1,0 +1,27 @@
+#!/usr/bin/env python
+"""
+        * TODO
+        * Rewrite using PMTs/message passing so a GR block emits PMT objs for
+        * tuning
+        *
+        * Look into using filterbanks to pull out channels for demod in the
+        * logging receiver.
+"""
+
+from optparse import OptionParser
+from gnuradio.eng_option import eng_option
+import scanner
+
+def main():
+    #add options to parser
+    parser = OptionParser (option_class=eng_option, conflict_handler="resolve")
+    scanner.scanner_radio.add_options(parser)
+    (options, args) = parser.parse_args()
+
+    tb = scanner.scanner_radio(options)
+    tb.run()
+    tb.close()
+
+if __name__ == "__main__":
+    main()
+
