@@ -1,0 +1,24 @@
+gr-scanner/README
+-----------------
+gr-scanner is a general-purpose trunked radio network scanner for Gnuradio. It is intended as a replacement for gr-smartnet.
+
+WHAT IT DOES
+------------
+Right now, not much. It will output audio for a single talkgroup on Motorola Smartnet-II networks, for both USRP devices and HackRF dongles. RTLSDRs will work too, but poorly (right now).
+
+WHAT IT WILL DO
+---------------
+The modular interface makes it easy to develop plugins to support other networks (EDACS) and other voice/data protocols (P25/ASTRO via the OP25 project). Plugins are under development to do:
+
+* EDACS
+* P25
+* Log all talkgroup activity to disk in realtime
+* Nice GUI
+
+HOW IT WORKS
+------------
+The core of the receiver is the trunked_feed object, which uses one of three strategies to provide a control channel (trunk) feed and an audio channel feed.
+For USRPs, the two DSP chains in the FPGA allow separate tuning for each of the two outputs, as long as they lie within the bandwidth of the device (they will).
+For RTLSDRs, the narrow bandwidth means we can't pull in the whole trunk at once, and we act like a "normal" scanner instead: monitor the control channel until we retune to audio,
+then jump back to the control channel when we're done.
+For HackRF/bladeRF, we use the analysis filterbank/polyphase decimator to channelize the whole bank and pull out just the channel we're interested in.
