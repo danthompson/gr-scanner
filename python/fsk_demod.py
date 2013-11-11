@@ -21,31 +21,22 @@ class fsk_demod(gr.hier_block2):
 
         #first bring that input stream down to a manageable level
         self._clockrec_oversample = 3
-
         self._decim = int(self._sps / self._clockrec_oversample)
-        self._downsampletaps = filter.firdes.low_pass(1.0/self._decim,
-                                                self._samples_per_second, 10000,
-                                                1000, filter.firdes.WIN_HANN)
-
         print "Demodulator decimation: %i" % self._decim
         print "Demodulator rate: %i" % (self._samples_per_second / self._decim)
+        self._downsampletaps = filter.firdes.low_pass(1.0/self._decim,
+                                                self._samples_per_second, 5000,
+                                                2000, filter.firdes.WIN_HANN)
 
-        #save a bunch of CPU if we're operating at the center freq already
-        if(self._freqoffset == 0):
-            self._downsample = filter.fft_filter_ccc(self._decim,
-                                                     self._downsampletaps)
-        else:
-            self._downsample = filter.freq_xlating_fir_filter_ccf(self._decim, #decimation
-                                                                  self._downsampletaps, #taps
-                                                                  self._freqoffset, #freq offset
-                                                                  self._samples_per_second) #sampling rate
-
-        #using a pll to demod gets you a nice IIR LPF response for free
-        self._demod = analog.pll_freqdet_cf(2.0 / self._clockrec_oversample, #gain alpha, rad/samp
-                                         2*pi/self._clockrec_oversample,  #max freq, rad/samp
-                                        -2*pi/self._clockrec_oversample)  #min freq, rad/samp
+        self._downsample = filter.fft_filter_ccc(self._decim,
+                                                self._downsampletaps)
 
         self._clockrec_sps = self._sps / self._decim
+
+        #using a pll to demod gets you a nice IIR LPF response for free
+        self._demod = analog.pll_freqdet_cf(2.0 / self._clockrec_sps, #gain alpha, rad/samp
+                                         2*pi/self._clockrec_sps,  #max freq, rad/samp
+                                        -2*pi/self._clockrec_sps)  #min freq, rad/samp
 
         #band edge filter FLL with a low bandwidth is very good
         #at synchronizing to continuous FSK signals
@@ -63,4 +54,7 @@ class fsk_demod(gr.hier_block2):
 
         self._slicer = digital.binary_slicer_fb()
 
-        self.connect(self, self._downsample, self._carriertrack, self._demod, self._softbits, self._slicer, self)
+        if self._decim > 1:
+            self.connect(self, self._downsample, self._carriertrack, self._demod, self._softbits, self._slicer, self)
+        else:
+            self.connect(self, self._carriertrack, self._demod, self._softbits, self._slicer, self)

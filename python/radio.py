@@ -24,7 +24,7 @@
 # It uses the pubsub interface to allow clients to subscribe to its data feeds.
 
 from gnuradio import gr, gru, eng_notation, filter, blocks, digital, analog, audio, uhd
-from gnuradio.filter import optfir
+from gnuradio.filter import pfb
 from gnuradio.eng_option import eng_option
 from gnuradio.gr.pubsub import pubsub
 from optparse import OptionParser, OptionGroup
@@ -88,13 +88,28 @@ class smartnet_ctrl_rx (gr.hier_block2):
         if self._assign_callback is not None and freq is not None:
             self._assign_callback(addr, groupflag, freq)
 
-#trunked_feed does whatever it takes to provide a control channel feed on ch1
-#and an audio channel feed on ch2.
-#Right now this is USRP-only, and single-channel-audio only.
-#Question: Should this class be able to output a very-wide aggregate channel,
-#multiple audio channels at will (not possible w/o GRAS?), or only single channel?
-#There's a lot of junk in here that will have to be replicated if you use another
-#class to handle the aggregate case.
+#so let's outline the operation modes this will be required to support.
+#1. 2 DSP, single audio channel. This is the current setup.
+#2. 1 DSP, single audio channel, narrowband. This is for RTLSDR. In this
+#   mode both outputs are identical...?
+#3. 1 DSP, single audio channel, wideband. This is for HackRF/BladeRF. in
+#   this mode the ctrl and audio channels are freq xlated from the input.
+#4. 1 DSP, full trunk output, wideband. This is for the logging receiver.
+#   Since you can't use multiple sample rates, this also applies to the UHD
+#   case. In this mode, the ctrl channel is freq xlated from the input, and
+#   the audio channel is the whole input.
+#
+#Cases 3 and 4 can probably be made identical. One caveat is we need to cope
+#with the sample rate of the control channel being different than the sample rate
+#of the audio channel; we should be doing this anyway. Basically we just avoid setting
+#the center frequency or the audio frequency in the #4 case, preferring to leave it
+#up to the logging receiver to pull that out.
+#Case 2 should be considered a failure case of case #3, where the bandwidth is under 4Msps.
+#
+#Also in #4 there is no freq xlator in the audio path, and set_audio_freq does nothing.
+#Again, we need to be sure to put decimation into the freq xlators for both #3 and #4,
+#and decimation into the ctrl path only for #4.
+
 class trunked_feed(gr.hier_block2, pubsub):
     def __init__(self, options):
         gr.hier_block2.__init__(self,
@@ -107,7 +122,7 @@ class trunked_feed(gr.hier_block2, pubsub):
                        "ctrl": options.ctrl_freq,
                        "audio": options.ctrl_freq
                       }
-        #create a source.
+
         if options.source == "uhd":
             #UHD source by default
             from gnuradio import uhd
@@ -119,30 +134,61 @@ class trunked_feed(gr.hier_block2, pubsub):
                 src.set_subdev_spec("A:0 A:0")
             if options.antenna is not None:
                 src.set_antenna(options.antenna)
-            src.set_samp_rate(options.rate)
+
+            #pick a reasonable sample rate
+            #criteria: closest to 50ksps (arbitrary), uses both halfbands
+            master_clock_rate = src.get_clock_rate()
+            acceptable_rates = [i.start() for i in src.get_samp_rates() if i.start() > 50e3 and (master_clock_rate / i.start()) % 4 == 0]
+            src.set_samp_rate(min(acceptable_rates))
+            self._channel_decimation = 1
+            print "Using sample rate: %i" % min(acceptable_rates)
             if options.gain is None: #set to halfway
                 g = src.get_gain_range()
                 options.gain = (g.start()+g.stop()) / 2.0
             src.set_gain(options.gain)
             print "Gain is %i" % src.get_gain()
 
+            self.connect((src,0), (self,0))
+            self.connect((src,1), (self,1))
+
         #TODO: detect if you're using an RTLSDR or Jawbreaker
         #and set up accordingly.
-        elif options.source == "osmocom": #RTLSDR dongle or HackRF Jawbreaker
-            raise Exception("Error: this isn't implemented yet.")
+        elif options.source == "hackrf" or options.source == "rtlsdr": #RTLSDR dongle or HackRF Jawbreaker
             import osmosdr
-            src = osmosdr.source(options.args)
-            src.set_sample_rate(options.rate)
-            src.get_samp_rate = src.get_sample_rate #alias for UHD compatibility
-            if not src.set_center_freq(162.0e6 * (1 + options.error/1.e6)):
-                print "Failed to set initial frequency"
-            else:
-                print "Tuned to %.3fMHz" % (src.get_center_freq() / 1.e6)
+            src = osmosdr.source(options.source)
+            wat = src.get_sample_rates()
+            rates = range(int(wat.start()), int(wat.stop()+1), int(wat.step()))
+            acceptable_rates = [i for i in rates if i >= 8e6]
+            if len(acceptable_rates) < 1: #we're in single-channel-only mode
+                acceptable_rates = (max(rates))
+            src.set_sample_rate(4e6)#min(acceptable_rates))
+            src.get_samp_rate = src.get_sample_rate #alias for UHD compatibility in get_rate
 
             if options.gain is None:
                 options.gain = 34
             src.set_gain(options.gain)
             print "Gain is %i" % src.get_gain()
+
+            #now we set up a pair of freq xlating FIRs to extract the ctrl channel and the audio channel
+            #doesn't have to be sharp at all
+            #instead of the usual freq_xlating_fir, we get weird and use a polyphase decimator.
+            #the polyphase decimator accomplishes integer decimation at the same time it extracts a channel
+            #(which must be offset by an integer multiple of the output rate, e.g. a Nyquist image).
+            self._channel_spacing = 12.5e3
+            self._channel_decimation = int(src.get_sample_rate() / self._channel_spacing)
+            assert(src.get_sample_rate() % self._channel_spacing == 0)
+
+            channel_taps = filter.firdes.low_pass_2(gain=1,
+                                                 sampling_freq=src.get_sample_rate(),
+                                                 cutoff_freq=self._channel_spacing*0.4,
+                                                 transition_width=self._channel_spacing*0.15,
+                                                 attenuation_dB=60.0,
+                                                 window=filter.firdes.WIN_HANN)
+
+            self._ctrlfilt = filter.pfb.decimator_ccf(self._channel_decimation, channel_taps, 0, 70)
+            self._audiofilt = filter.pfb.decimator_ccf(self._channel_decimation, channel_taps, 0, 70)
+            self.connect(src, self._ctrlfilt, (self,0))
+            self.connect(src, self._audiofilt, (self,1))
 
         else:
             #semantically detect whether it's ip.ip.ip.ip:port or filename
@@ -159,15 +205,18 @@ class trunked_feed(gr.hier_block2, pubsub):
                 src = blocks.file_source(gr.sizeof_gr_complex, options.source)
                 print "Using file source %s" % options.source
 
-        self.connect((src,0), (self,0))
-        self.connect((src,1), (self,1))
         self._data_src = src
+        self._source_name = options.source
         self.set_center_freq(options.center_freq)
-        self.set_freq("ctrl", options.ctrl_freq)
-        self.set_freq("audio", options.ctrl_freq) #wooboobooboboobobbo
+        self.set_ctrl_freq(options.ctrl_freq)
+        self.set_audio_freq(options.ctrl_freq) #wooboobooboboobobbo
+
+        print "Using master rate: %f" % self.get_rate("master")
+        print "Using ctrl rate: %f" % self.get_rate("ctrl")
+        print "Using audio rate: %f" % self.get_rate("audio")
 
     def live_source(self):
-        return self._options.source=="uhd" or self._options.source=="osmocom"
+        return self._options.source in ("uhd", "osmocom", "hackrf", "rtlsdr")
 
     def set_gain(self, gain):
         if self.live_source():
@@ -182,35 +231,68 @@ class trunked_feed(gr.hier_block2, pubsub):
     def get_gain(self):
         return self._data_src.get_gain() if self.live_source() else 0
 
-    def get_rate(self):
-        return self._data_src.get_samp_rate() if self.live_source() else self._rate
+    def get_rate(self, channel="master"):
+        if self.live_source():
+            master_rate = self._data_src.get_samp_rate()
+        else:
+            master_rate = self._rate
+        if channel == "ctrl":
+            return float(master_rate) / self._channel_decimation
+        elif channel == "audio":
+            #TODO return full rate if operating in "wideband" mode
+            return float(master_rate) / self._channel_decimation
+        elif channel == "master":
+            return float(master_rate)
 
     def set_center_freq(self, freq):
-        tr = uhd.tune_request_t()
-        tr.rf_freq_policy = uhd.tune_request_t.POLICY_MANUAL
-        tr.dsp_freq_policy = uhd.tune_request_t.POLICY_MANUAL
-        tr.rf_freq = freq
-        tr.target_freq = freq
-        tune_result = self._data_src.set_center_freq(tr,0)
-        self._freqs["center"] = freq
+        if self._source_name == "uhd":
+            tr = uhd.tune_request_t()
+            tr.rf_freq_policy = uhd.tune_request_t.POLICY_MANUAL
+            tr.dsp_freq_policy = uhd.tune_request_t.POLICY_MANUAL
+            tr.rf_freq = freq
+            tr.target_freq = freq
+            tune_result = self._data_src.set_center_freq(tr,0)
+            self._freqs["center"] = tune_result.actual_rf_freq
+        elif self._source_name in ("hackrf", "rtlsdr"):
+            self._data_src.set_center_freq(freq)
+            self._freqs["center"] = self._data_src.get_center_freq()
+
         self.set_freq("ctrl", self._freqs["ctrl"])
         self.set_freq("audio", self._freqs["audio"])
 
     def set_freq(self, chan, freq):
-        print "Setting %s to %.3fMHz" % (chan, freq/1.e6)
-        chan_num = ["ctrl", "audio"].index(chan)
-        tr = uhd.tune_request_t()
-        tr.rf_freq_policy = uhd.tune_request_t.POLICY_MANUAL
-        tr.dsp_freq_policy = uhd.tune_request_t.POLICY_MANUAL
-        tr.dsp_freq = self._freqs["center"] - freq
-        tr.rf_freq = self._freqs["center"]
-        tr.target_freq = self._freqs["center"]
-        tune_result = self._data_src.set_center_freq(tr, chan_num)
-        print "Center frequency: %.3fMHz" % (tune_result.actual_rf_freq/1.e6)
-        print "DSP frequency: %.3fMHz" % (tune_result.actual_dsp_freq/1.e6)
-        print "%s channel: %.3fMHz" % (chan,
-                                    ((tune_result.actual_rf_freq - tune_result.actual_dsp_freq)/1.e6)
-                                    )
+        print "Setting %s to %.4fMHz" % (chan, freq/1.e6)
+        if self._source_name == "uhd":
+            tr = uhd.tune_request_t()
+            tr.rf_freq_policy = uhd.tune_request_t.POLICY_MANUAL
+            tr.dsp_freq_policy = uhd.tune_request_t.POLICY_MANUAL
+            tr.dsp_freq = self._freqs["center"] - freq
+            tr.rf_freq = self._freqs["center"]
+            tr.target_freq = self._freqs["center"]
+            chan_num = ["ctrl", "audio"].index(chan)
+            tune_result = self._data_src.set_center_freq(tr, chan_num)
+            print "Center frequency: %.4fMHz" % (tune_result.actual_rf_freq/1.e6)
+            print "DSP frequency: %.4fMHz" % (tune_result.actual_dsp_freq/1.e6)
+            print "%s channel: %.4fMHz" % (chan,
+                                        ((tune_result.actual_rf_freq - tune_result.actual_dsp_freq)/1.e6)
+                                        )
+        elif self._source_name in ("hackrf", "rtlsdr"):
+            assert((self._freqs["center"] % self._channel_spacing) < 1e-4)
+            #find the channel number
+            offset = freq - self._freqs["center"]
+            if abs(offset) > (self.get_rate("master") / 2):
+                #TODO: handle this by retuning the center/operating single-channel
+                print "Asked for a channel outside the band"
+                return
+            chan_num = int(offset / self._channel_spacing)
+            if(chan_num < 0):
+                chan_num = int(self.get_rate("master") / self._channel_spacing) + chan_num
+            if chan == "ctrl":
+                self._ctrlfilt.set_channel(chan_num)
+            elif chan == "audio":
+                self._audiofilt.set_channel(chan_num)
+            print "Setting channel %i" % (chan_num)
+
         self._freqs[chan] = freq
 
     def set_ctrl_freq(self, freq):
@@ -228,7 +310,7 @@ class trunked_feed(gr.hier_block2, pubsub):
 
         #Choose source
         group.add_option("-s","--source", type="string", default="uhd",
-                        help="Choose source: uhd, osmocom, <filename>, or <ip:port> [default=%default]")
+                        help="Choose source: uhd, hackrf, rtlsdr, <filename>, or <ip:port> [default=%default]")
         #UHD/Osmocom args
         group.add_option("-R", "--subdev", type="string",
                         help="select USRP Rx side A or B", metavar="SUBDEV")
@@ -241,8 +323,6 @@ class trunked_feed(gr.hier_block2, pubsub):
         parser.add_option("-e", "--error", type="eng_float", default=0,
                             help="set offset error of device in ppm [default=%default]")
         #RX path args
-        group.add_option("-r", "--rate", type="eng_float", default=250e3,
-                        help="set sample rate [default=%default]")
         group.add_option("-f", "--ctrl-freq", type="eng_float",
                          default=851.425e6,
                          help="control channel frequency [default=%default]")
@@ -260,16 +340,12 @@ class audio_path (gr.hier_block2, pubsub):
         pubsub.__init__(self)
         self._options = options
         self.audiorate = options.audio_rate
-        self.audiotaps = filter.firdes.low_pass(1, options.rate, 8000, 2000,
-                                                filter.firdes.WIN_HANN)
-        print "Number of audio taps: %i" % len(self.audiotaps)
-        self.prefilter_decim = int(options.rate / self.audiorate) #might have to use a rational resampler for audio
-        print "Prefilter decimation: %i" % self.prefilter_decim
-        self.audio_prefilter = filter.fft_filter_ccc(self.prefilter_decim, #decimation
-                                        self.audiotaps) #taps
+        self.prefilter_decim = float(options.rate) / self.audiorate
+        print "Audio demod decimation: %f" % self.prefilter_decim
+        self.audio_prefilter = filter.pfb.arb_resampler_ccf(1.0/self.prefilter_decim)
 
         #on a trunked network where you know you will have good signal,
-        #a carrier power squelch works well. real FM receviers use a
+        #a carrier power squelch works well. real FM receivers use a
         #noise squelch, where the received audio is high-passed above
         #the cutoff and then fed to a reverse squelch. If the power is
         #then BELOW a threshold, open the squelch.
@@ -278,22 +354,21 @@ class audio_path (gr.hier_block2, pubsub):
                                             ramp = 10, #wat
                                             gate = False)
 
-        self.audiodemod = analog.fm_demod_cf(options.rate/self.prefilter_decim, #rate
+        self.audiodemod = analog.fm_demod_cf(self.audiorate, #rate
                             1, #audio decimation
                             4000, #deviation
                             3000, #audio passband
                             4000, #audio stopband
-                            1, #gain
+                            options.volume, #gain
                             75e-6) #deemphasis constant
 
-        #the filtering removes FSK data woobling from the subaudible channel (might be able to combine w/lpf above)
+        #the filtering removes FSK data woobling from the subaudible channel
         self.audiofilttaps = filter.firdes.high_pass(1, self.audiorate, 300,
                                                         50, filter.firdes.WIN_HANN)
         self.audiofilt = filter.fft_filter_fff(1, self.audiofilttaps)
-        self.audiogain = blocks.multiply_const_ff(options.volume)
         self.audiosink = audio.sink(int(self.audiorate), "")
 
-        self.connect(self, self.audio_prefilter, self.squelch, self.audiodemod, self.audiofilt, self.audiogain, self.audiosink)
+        self.connect(self, self.audio_prefilter, self.squelch, self.audiodemod, self.audiofilt, self.audiosink)
 
     @staticmethod
     def add_options(parser):
@@ -314,13 +389,12 @@ class scanner_radio (gr.top_block, pubsub):
         self._options = options
 
         self._feed = trunked_feed(options)
-        self._rate = self._feed.get_rate()
         self._monitor = [int(i) for i in options.monitor.split(",")]
         self._tg_assignments = {}
-        print "Rate is %i" % (self._rate,)
 
-        self._data_path = smartnet_ctrl_rx(self._rate, 0)
+        self._data_path = smartnet_ctrl_rx(self._feed.get_rate("ctrl"), 0)
         self.connect((self._feed,0), self._data_path)
+        options.rate = self._feed.get_rate("audio")
         self._audio_path = audio_path(options)
         self.connect((self._feed,1), self._audio_path)
 
@@ -329,8 +403,7 @@ class scanner_radio (gr.top_block, pubsub):
 
     def handle_assignment(self, addr, groupflag, freq):
         #TODO handle all channel assignment and priority monitor stuff here
-        if (addr & 0xFFF0) in self._monitor \
-        and self._tg_assignments.get(addr) != freq: #mask because last 4 bits is priority mask
+        if (addr & 0xFFF0) in self._monitor:# and self._tg_assignments.get(addr) != freq: #mask because last 4 bits is priority mask
             self._feed.set_audio_freq(freq)
 
         self._tg_assignments[addr] = freq
