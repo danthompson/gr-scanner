@@ -16,7 +16,7 @@
 # along with GNU Radio; see the file COPYING.  If not, write to
 # the Free Software Foundation, Inc., 51 Franklin Street,
 # Boston, MA 02110-1301, USA.
-#install(FILES
-#    smartnet_crc.xml
-#    smartnet_deinterleave.xml DESTINATION share/gnuradio/grc/blocks
-#)
+install(FILES
+    invert.xml
+    scanner_edacs_pkt_rx.xml DESTINATION share/gnuradio/grc/blocks
+)

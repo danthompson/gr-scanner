@@ -38,7 +38,7 @@ import scanner
 #could probably be split into its own file
 #this should eventually spit out PMTs with control commands
 class smartnet_ctrl_rx (gr.hier_block2):
-    def __init__(self, rate, offset): #TODO pass in chanlist
+    def __init__(self, rate): #TODO pass in chanlist
         gr.hier_block2.__init__(self,
                                 "smartnet_ctrl_rx",
                                 gr.io_signature(1,1,gr.sizeof_gr_complex),
@@ -51,7 +51,7 @@ class smartnet_ctrl_rx (gr.hier_block2):
         self._syms_per_sec = 3600.
         self._sps = rate / self._syms_per_sec
 
-        self._demod = scanner.fsk_demod(self._sps, 0.1, offset)
+        self._demod = scanner.fsk_demod(self._sps, 0.1)
         self._sof = digital.correlate_access_code_tag_bb("10101100",
                                                           0,
                                                          "smartnet_preamble")
@@ -88,27 +88,85 @@ class smartnet_ctrl_rx (gr.hier_block2):
         if self._assign_callback is not None and freq is not None:
             self._assign_callback(addr, groupflag, freq)
 
-#so let's outline the operation modes this will be required to support.
-#1. 2 DSP, single audio channel. This is the current setup.
-#2. 1 DSP, single audio channel, narrowband. This is for RTLSDR. In this
-#   mode both outputs are identical...?
-#3. 1 DSP, single audio channel, wideband. This is for HackRF/BladeRF. in
-#   this mode the ctrl and audio channels are freq xlated from the input.
-#4. 1 DSP, full trunk output, wideband. This is for the logging receiver.
-#   Since you can't use multiple sample rates, this also applies to the UHD
-#   case. In this mode, the ctrl channel is freq xlated from the input, and
-#   the audio channel is the whole input.
-#
-#Cases 3 and 4 can probably be made identical. One caveat is we need to cope
-#with the sample rate of the control channel being different than the sample rate
-#of the audio channel; we should be doing this anyway. Basically we just avoid setting
-#the center frequency or the audio frequency in the #4 case, preferring to leave it
-#up to the logging receiver to pull that out.
-#Case 2 should be considered a failure case of case #3, where the bandwidth is under 4Msps.
-#
-#Also in #4 there is no freq xlator in the audio path, and set_audio_freq does nothing.
-#Again, we need to be sure to put decimation into the freq xlators for both #3 and #4,
-#and decimation into the ctrl path only for #4.
+
+class edacs_ctrl_rx(gr.hier_block2):
+    def __init__(self, rate): #TODO pass in chanlist
+        gr.hier_block2.__init__(self,
+                                "edacs_ctrl_rx",
+                                gr.io_signature(1,1,gr.sizeof_gr_complex),
+                                gr.io_signature(0,0,0))
+
+        self.set_assign_callback(None)
+        self._queue = gr.msg_queue()
+        self._async_sender = gru.msgq_runner(self._queue, self.msg_handler)
+
+        self._syms_per_sec = 9600.
+        self._sps = rate / self._syms_per_sec
+
+        self._demod = scanner.fsk_demod(self._sps, 0.575)
+        self._invert = scanner.invert()
+        self._sof = digital.correlate_access_code_tag_bb("010101010101010101010111000100100101010101010101",
+                                                          0,
+                                                         "edacs_preamble")
+        self._rx = scanner.edacs_pkt_rx(self._queue)
+        self.connect(self, self._demod, self._invert, self._sof, self._rx)
+
+    #TODO reimplement the chanlist
+    def cmd_to_freq(self, chanlist, cmd):
+        return None
+
+    def set_assign_callback(self, func):
+        self._assign_callback = func
+
+    def msg_handler(self, msg):
+        msg = scanner.edacs_pkt(int(msg.to_string(),16))
+        commands = { 0xA0: "Data assignment",
+                     0xA1: "Data assignment",
+                     0xEC: "Phone patch",
+                     0xEE: "Voice assigment",
+                     0xFC: "Idle",
+                     0xFD: "System ID"
+                   }
+        if msg["cmd"] not in commands:
+            cmdstring = "N/A"
+        else:
+            cmdstring = commands[msg["cmd"]]
+#        print "EDACS: Cmd: %s LCN: %x" % (cmdstring, msg["lcn"])
+        if msg["cmd"] in (0xA0, 0xA1, 0xEC, 0xEE):
+            if msg["id"].get_type() == 1:
+                print "Individual call to %x on LCN %i" % (msg["id"]["id"], msg["lcn"])
+            else:
+                print "Group call to agency %i, fleet %i, subfleet %i on LCN %i" % (msg["id"]["agency"],
+                                                                                    msg["id"]["fleet"], 
+                                                                                    msg["id"]["subfleet"],
+                                                                                    msg["lcn"])
+        elif msg["cmd"] == 0xFD:
+            print "EDACS system id: %x" % msg["id"]
+        else:
+            print "EDACS %s" % cmdstring
+
+class filterbank(gr.hier_block2):
+    def __init__(self, rate, channel_spacing):
+        gr.hier_block2.__init__(self,
+                                "filterbank",
+                                gr.io_signature(1,1,gr.sizeof_gr_complex),
+                                gr.io_signature(2,2,gr.sizeof_gr_complex))
+        self._channel_spacing = channel_spacing
+        self._rate = rate
+        numchans = int(rate/self._channel_spacing)
+        self._bank = pfb.channelizer_ccf(numchans)
+        self._map = [0,0]
+        self._bank.set_channel_map(self._map)
+        self.connect(self, self._bank)
+        self.connect(self._bank, (self,0))
+        self.connect(self._bank, (self,1))
+
+    def set_freq(self, chan, offset):
+        chan_num = int(offset / self._channel_spacing)
+        if(chan_num < 0):
+            chan_num = int(self._rate / self._channel_spacing) + chan_num
+        self._map[chan] = chan_num
+        self._bank.set_channel_map(self._map)
 
 class trunked_feed(gr.hier_block2, pubsub):
     def __init__(self, options):
@@ -168,31 +226,16 @@ class trunked_feed(gr.hier_block2, pubsub):
                 options.gain = 34
             src.set_gain(options.gain)
             print "Gain is %i" % src.get_gain()
-
-            #now we set up a pair of freq xlating FIRs to extract the ctrl channel and the audio channel
-            #doesn't have to be sharp at all
-            #instead of the usual freq_xlating_fir, we get weird and use a polyphase decimator.
-            #the polyphase decimator accomplishes integer decimation at the same time it extracts a channel
-            #(which must be offset by an integer multiple of the output rate, e.g. a Nyquist image).
-            self._channel_spacing = 12.5e3
-            self._channel_decimation = int(src.get_sample_rate() / self._channel_spacing)
-            assert(src.get_sample_rate() % self._channel_spacing == 0)
-
-            channel_taps = filter.firdes.low_pass_2(gain=1,
-                                                 sampling_freq=src.get_sample_rate(),
-                                                 cutoff_freq=self._channel_spacing*0.4,
-                                                 transition_width=self._channel_spacing*0.15,
-                                                 attenuation_dB=60.0,
-                                                 window=filter.firdes.WIN_HANN)
-
-            self._ctrlfilt = filter.pfb.decimator_ccf(self._channel_decimation, channel_taps, 0, 70)
-            self._audiofilt = filter.pfb.decimator_ccf(self._channel_decimation, channel_taps, 0, 70)
-            self.connect(src, self._ctrlfilt, (self,0))
-            self.connect(src, self._audiofilt, (self,1))
+            channel_spacing = 12.5e3
+            self._channel_decimation = int(src.get_sample_rate() / channel_spacing)
+            filter_bank = filterbank(rate=src.get_sample_rate(),
+                                            channel_spacing=channel_spacing) #TODO parameterize
+            self.connect(self, filter_bank)
+            self.connect((filter_bank,0), (self,0))
+            self.connect((filter_bank,1), (self,1))
 
         else:
             #semantically detect whether it's ip.ip.ip.ip:port or filename
-            raise Exception("Error: this isn't implemented yet.")
             self._rate = options.rate
             if ':' in options.source:
                 try:
@@ -204,6 +247,15 @@ class trunked_feed(gr.hier_block2, pubsub):
             else:
                 src = blocks.file_source(gr.sizeof_gr_complex, options.source)
                 print "Using file source %s" % options.source
+
+            channel_spacing = 12.5e3
+            self._channel_decimation = int(options.rate / channel_spacing)
+            self._filter_bank = filterbank(rate=options.rate,
+                                            channel_spacing=channel_spacing) #TODO parameterize
+            self.connect(src, self._filter_bank)
+            self.connect((self._filter_bank,0), (self,0))
+            self.connect((self._filter_bank,1), (self,1))
+
 
         self._data_src = src
         self._source_name = options.source
@@ -262,6 +314,7 @@ class trunked_feed(gr.hier_block2, pubsub):
 
     def set_freq(self, chan, freq):
         print "Setting %s to %.4fMHz" % (chan, freq/1.e6)
+        chan_num = ["ctrl", "audio"].index(chan)
         if self._source_name == "uhd":
             tr = uhd.tune_request_t()
             tr.rf_freq_policy = uhd.tune_request_t.POLICY_MANUAL
@@ -269,28 +322,20 @@ class trunked_feed(gr.hier_block2, pubsub):
             tr.dsp_freq = self._freqs["center"] - freq
             tr.rf_freq = self._freqs["center"]
             tr.target_freq = self._freqs["center"]
-            chan_num = ["ctrl", "audio"].index(chan)
             tune_result = self._data_src.set_center_freq(tr, chan_num)
             print "Center frequency: %.4fMHz" % (tune_result.actual_rf_freq/1.e6)
             print "DSP frequency: %.4fMHz" % (tune_result.actual_dsp_freq/1.e6)
             print "%s channel: %.4fMHz" % (chan,
                                         ((tune_result.actual_rf_freq - tune_result.actual_dsp_freq)/1.e6)
                                         )
-        elif self._source_name in ("hackrf", "rtlsdr"):
-            assert((self._freqs["center"] % self._channel_spacing) < 1e-4)
+        else:
             #find the channel number
             offset = freq - self._freqs["center"]
             if abs(offset) > (self.get_rate("master") / 2):
                 #TODO: handle this by retuning the center/operating single-channel
                 print "Asked for a channel outside the band"
                 return
-            chan_num = int(offset / self._channel_spacing)
-            if(chan_num < 0):
-                chan_num = int(self.get_rate("master") / self._channel_spacing) + chan_num
-            if chan == "ctrl":
-                self._ctrlfilt.set_channel(chan_num)
-            elif chan == "audio":
-                self._audiofilt.set_channel(chan_num)
+            self._filter_bank.set_freq(chan_num, offset)
             print "Setting channel %i" % (chan_num)
 
         self._freqs[chan] = freq
@@ -329,6 +374,8 @@ class trunked_feed(gr.hier_block2, pubsub):
         group.add_option("-c", "--center-freq", type="eng_float",
                          default=852e6,
                          help="tuner center frequency [default=%default]")
+        group.add_option("-r", "--rate", type="eng_float", default=None,
+                         help="sample rate, leave blank for automatic")
         parser.add_option_group(group)
 
 class audio_path (gr.hier_block2, pubsub):
@@ -392,7 +439,12 @@ class scanner_radio (gr.top_block, pubsub):
         self._monitor = [int(i) for i in options.monitor.split(",")]
         self._tg_assignments = {}
 
-        self._data_path = smartnet_ctrl_rx(self._feed.get_rate("ctrl"), 0)
+        if options.type == 'smartnet':
+            self._data_path = smartnet_ctrl_rx(self._feed.get_rate("ctrl"))
+        elif options.type == 'edacs':
+            self._data_path = edacs_ctrl_rx(self._feed.get_rate("ctrl"))
+        else:
+            raise Exception("Invalid network type (must be edacs or smartnet)")
         self.connect((self._feed,0), self._data_path)
         options.rate = self._feed.get_rate("audio")
         self._audio_path = audio_path(options)
@@ -416,6 +468,8 @@ class scanner_radio (gr.top_block, pubsub):
         #Choose source
         group.add_option("-m","--monitor", type="string", default="0",
                         help="Monitor a list of talkgroups (comma-separated) [default=%default]")
+        group.add_option("-t","--type", type="string", default="smartnet",
+                         help="Network type (edacs or smartnet only) [default=%default]")
         parser.add_option_group(group)
 
 

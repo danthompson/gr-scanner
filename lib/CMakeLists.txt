@@ -26,7 +26,9 @@ include_directories(${Boost_INCLUDE_DIR})
 link_directories(${Boost_LIBRARY_DIRS})
 list(APPEND scanner_sources
     crc_impl.cc
-    deinterleave_impl.cc )
+    deinterleave_impl.cc
+    invert_impl.cc
+    edacs_pkt_rx_impl.cc)
 
 add_library(gnuradio-scanner SHARED ${scanner_sources})
 target_link_libraries(gnuradio-scanner ${Boost_LIBRARIES} ${GNURADIO_RUNTIME_LIBRARIES})

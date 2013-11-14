@@ -45,7 +45,7 @@ if _RTLD_GLOBAL != 0:
 from scanner_swig import *
 
 # import any pure python here
-#
+from edacs_parse import edacs_pkt
 from fsk_demod import fsk_demod
 from radio import scanner_radio
 

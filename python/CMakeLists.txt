@@ -31,6 +31,7 @@ endif()
 GR_PYTHON_INSTALL(
     FILES
     __init__.py
+    edacs_parse.py
     fsk_demod.py
     radio.py
     DESTINATION ${GR_PYTHON_DIR}/scanner

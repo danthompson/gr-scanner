@@ -23,5 +23,7 @@
 install(FILES
     api.h
     crc.h
-    deinterleave.h DESTINATION include/scanner
+    deinterleave.h 
+    invert.h
+    edacs_pkt_rx.h DESTINATION include/scanner
 )

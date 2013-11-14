@@ -4,32 +4,32 @@
 
 from gnuradio import gr, gru, digital, analog, blocks, filter
 from gnuradio import eng_notation
+from gnuradio.filter import pfb
 from math import pi
 
 class fsk_demod(gr.hier_block2):
-    def __init__(self, sps, gain_mu, offset):
+    def __init__(self, sps, gain_mu):
         gr.hier_block2.__init__(self, "fsk_demod",
                                 gr.io_signature(1, 1, gr.sizeof_gr_complex), # Input signature
                                 gr.io_signature(1, 1, gr.sizeof_char)) # Output signature
 
         self._sps = float(sps)
         self._gain_mu = gain_mu # for the clock recovery block
-        self._freqoffset = offset
         self._mu = 0.5
         self._omega_relative_limit = 0.3
-        self._samples_per_second = self._sps*3600 #TODO MAGIC
 
         #first bring that input stream down to a manageable level
-        self._clockrec_oversample = 3
-        self._decim = int(self._sps / self._clockrec_oversample)
-        print "Demodulator decimation: %i" % self._decim
-        print "Demodulator rate: %i" % (self._samples_per_second / self._decim)
+        self._clockrec_oversample = 3.0
+        self._decim = self._sps / self._clockrec_oversample
+        print "Demodulator decimation: %f" % self._decim
         self._downsampletaps = filter.firdes.low_pass(1.0/self._decim,
-                                                self._samples_per_second, 5000,
-                                                2000, filter.firdes.WIN_HANN)
+                                                1.0, 0.4,
+                                                0.05, filter.firdes.WIN_HANN)
 
-        self._downsample = filter.fft_filter_ccc(self._decim,
-                                                self._downsampletaps)
+#        self._downsample = filter.fft_filter_ccc(self._decim,
+#                                                self._downsampletaps)
+
+        self._downsample = pfb.arb_resampler_ccf(1/self._decim)
 
         self._clockrec_sps = self._sps / self._decim
 
