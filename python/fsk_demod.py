@@ -16,7 +16,7 @@ class fsk_demod(gr.hier_block2):
         self._sps = float(sps)
         self._gain_mu = gain_mu # for the clock recovery block
         self._mu = 0.5
-        self._omega_relative_limit = 0.3
+        self._omega_relative_limit = 0.35
 
         #first bring that input stream down to a manageable level
         self._clockrec_oversample = 3.0
@@ -29,6 +29,7 @@ class fsk_demod(gr.hier_block2):
 #        self._downsample = filter.fft_filter_ccc(self._decim,
 #                                                self._downsampletaps)
 
+        #sure this works but it's a little heavy on the CPU at high rates
         self._downsample = pfb.arb_resampler_ccf(1/self._decim)
 
         self._clockrec_sps = self._sps / self._decim

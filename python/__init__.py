@@ -45,9 +45,12 @@ if _RTLD_GLOBAL != 0:
 from scanner_swig import *
 
 # import any pure python here
+from audio import audio_path
+from ctrl_chan import smartnet_ctrl_rx, edacs_ctrl_rx
 from edacs_parse import edacs_pkt
 from fsk_demod import fsk_demod
-from radio import scanner_radio
+from radio import trunked_feed
+from trunked_scanner import trunked_scanner
 
 # ----------------------------------------------------------------
 # Tail of workaround
