@@ -62,9 +62,9 @@ namespace gr {
         //extract data from checksum
         uint16_t checksum = pkt | 0xFFF;
         uint64_t data = pkt >> 12;
-        uint16_t poly = 0x707;
-        //TODO HALP
-        return 1;
+        uint16_t poly = 0x7D7;
+        uint16_t crc = 0;
+        return 1; //TODO HALP
     }
 
     int

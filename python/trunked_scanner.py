@@ -9,7 +9,7 @@ class trunked_scanner(gr.top_block, pubsub):
         pubsub.__init__(self)
         self._options = options
 
-        self._feed = scanner.trunked_feed(options)
+        self._feed = scanner.trunked_feed(options, nchans=2)
         self._monitor = [int(i) for i in options.monitor.split(",")]
         self._tg_assignments = {}
 

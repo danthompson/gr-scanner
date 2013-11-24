@@ -21,14 +21,45 @@
 # Radio interface for gr-scanner
 # Handles all hardware- and source-related functionality
 # You pass it options, it gives you data.
-# It uses the pubsub interface to allow clients to subscribe to its data feeds.
 
 from gnuradio import gr, blocks, uhd
 from gnuradio.filter import pfb
 from gnuradio.eng_option import eng_option
 from gnuradio.gr.pubsub import pubsub
+from gnuradio.analog.fm_emph import fm_deemph
 from optparse import OptionParser, OptionGroup
 import scanner
+
+class fm_demod(gr.hier_block2):
+    """
+    This class is essentially identical to the fm_demod_cf included
+    in Gnuradio, except that we use bandpass taps instead of lowpass taps
+    in order to remove the subaudible tone woobling <250Hz. We also use a
+    pfb_arb_resampler instead of the usual decimating filter to get
+    arbitrary sample rate output. This way we don't have to immediately
+    follow the fm_demod with a resampler to get to whatever audio rate.
+    """
+    def __init__(self, rate, decim):
+        gr.hier_block2.__init__(self,
+                                "fm_demod",
+                                gr.io_signature(1,1,gr.sizeof_gr_complex),
+                                gr.io_signature(1,1,gr.sizeof_float))
+        tau=75.e-6
+        deviation = 5.e3
+        k=rate/(2*pi*deviation)
+        quad = analog.quadrature_demod_cf(k)
+        deemph = fm_deemph(rate, tau)
+        nfilts = 32
+        audio_taps = filter.optfir.band_pass(nfilts, #gain
+                                            rate*nfilts, #rate
+                                            250,  #stopband_lo
+                                            300,  #passband_lo
+                                            3000, #passband_hi
+                                            4500, #stopband_hi
+                                            0.2,  #passband ripple
+                                            60)   #stopband atten
+        resamp = filter.pfb_arb_resampler_cf(1./decim, audio_taps)
+        self.connect(self, quad, deemph, resamp, self)
 
 class filterbank(gr.hier_block2):
     def __init__(self, rate, channel_spacing):
@@ -50,22 +81,69 @@ class filterbank(gr.hier_block2):
         assert(offset % self._channel_spacing < 1e-4)
         chan_num = int(offset / self._channel_spacing)
         if(chan_num < 0):
-            chan_num = int(self._rate / self._channel_spacing) + chan_num
+            chan_num += int(self._rate / self._channel_spacing)
         self._map[chan] = chan_num
         self._bank.set_channel_map(self._map)
 
+class wavsink_path(gr.hier_block2):
+    def __init__(self, rate, filename, squelch):
+        gr.hier_block2.__init__(self,
+                                "logging_receiver",
+                                gr.io_signature(nchans, nchans, gr.sizeof_gr_complex),
+                                gr.io_signature(0,0,0))
+        self._rate = rate
+        self._filename = filename
+        self._squelch = squelch
+        self._audiorate = 8000
+        self._decim = float(self._rate) / self._audiorate
+        self._squelch = analog.pwr_squelch_cc(squelch,
+                                            alpha = 0.1, #wat
+                                            ramp = 10, #wat
+                                            gate = False)
+        self._demod = fm_demod(self._rate, #rate
+                               self._decim) #audio decimation
+        self._valve = blks2.valve(gr.sizeof_float, False)
+        self._audiosink = blocks.wavfile_sink(self._filename, 1, self._audiorate, 8)
+        self.connect(self, self._decim, self._squelch, self._demod, self._valve, self._audiosink)
+
+    def enable(self, enable):
+        """
+        open the valve and allow recording to the wavfile (assuming enough pwr for pwr squelch to open)
+        """
+        self._valve.set_open(not enable)
+    def mute(self):
+        self.enable(False)
+    def unmute(self):
+        self.enable(True)
+
+class logging_receiver(gr.hier_block2):
+    def __init__(self, rate, nchans):
+        gr.hier_block2.__init__(self,
+                                "logging_receiver",
+                                gr.io_signature(nchans, nchans, gr.sizeof_gr_complex),
+                                gr.io_signature(0,0,0))
+
+        self._rate = rate
+        self._nchans = nchans
+        self._recorders = []
+        self._squelch = -50 #TODO PARAMETERIZE
+        for i in xrange(nchans):
+            self._recorders.append(wavsink_path(rate, "how do i filename", self._squelch)) #TODO FILENAME
+            self.connect((self, i), self._recorders[-1])
+
 class trunked_feed(gr.hier_block2, pubsub):
-    def __init__(self, options):
+    def __init__(self, options, nchans=16):
         gr.hier_block2.__init__(self,
                                 "trunked_feed",
                                 gr.io_signature(0,0,gr.sizeof_gr_complex),
-                                gr.io_signature(2,2,gr.sizeof_gr_complex))
+                                gr.io_signature(nchans,nchans,gr.sizeof_gr_complex))
         pubsub.__init__(self)
         self._options = options
         self._freqs = {"center": options.center_freq,
                        "ctrl": options.ctrl_freq,
                        "audio": options.ctrl_freq
                       }
+        self._nchans = nchans
 
         if options.source == "uhd":
             #UHD source by default
@@ -124,10 +202,10 @@ class trunked_feed(gr.hier_block2, pubsub):
         self._channel_decimation = int(options.rate / channel_spacing)
         self._filter_bank = filterbank(rate=options.rate,
                                         channel_spacing=channel_spacing) #TODO parameterize
-        self.connect(src, self._filter_bank)
-        self.connect((self._filter_bank,0), (self,0))
-        self.connect((self._filter_bank,1), (self,1))
 
+        self.connect(src, self._filter_bank)
+        for i in xrange(self._nchans)
+            self.connect((self._filter_bank,i), (self, n))
 
         self._data_src = src
         self._source_name = options.source
