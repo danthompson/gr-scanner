@@ -28,9 +28,7 @@ list(APPEND scanner_sources
     crc_impl.cc
     deinterleave_impl.cc
     invert_impl.cc
-    edacs_pkt_rx_impl.cc
-    squelch_base_ff_impl.cc
-    noise_squelch_ff_impl.cc)
+    edacs_pkt_rx_impl.cc)
 
 add_library(gnuradio-scanner SHARED ${scanner_sources})
 target_link_libraries(gnuradio-scanner ${Boost_LIBRARIES} ${GNURADIO_RUNTIME_LIBRARIES})

@@ -25,6 +25,5 @@ install(FILES
     crc.h
     deinterleave.h 
     invert.h
-    edacs_pkt_rx.h 
-    noise_squelch_ff.h DESTINATION include/scanner
+    edacs_pkt_rx.h DESTINATION include/scanner
 )
