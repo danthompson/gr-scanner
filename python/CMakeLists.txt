@@ -37,6 +37,7 @@ GR_PYTHON_INSTALL(
     fsk_demod.py
     radio.py
     trunked_scanner.py
+    standard_squelch_ff.py
     DESTINATION ${GR_PYTHON_DIR}/scanner
 )
 

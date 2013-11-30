@@ -22,24 +22,26 @@
 # Handles all hardware- and source-related functionality
 # You pass it options, it gives you data.
 
-from gnuradio import gr, blocks, uhd
-from gnuradio.filter import pfb
+from gnuradio import gr, blocks, uhd, analog
+from gnuradio.filter import pfb, optfir
 from gnuradio.eng_option import eng_option
 from gnuradio.gr.pubsub import pubsub
 from gnuradio.analog.fm_emph import fm_deemph
 from optparse import OptionParser, OptionGroup
+from math import pi
 import scanner
 
 class fm_demod(gr.hier_block2):
     """
-    This class is essentially identical to the fm_demod_cf included
+    This class is mostly identical to the fm_demod_cf included
     in Gnuradio, except that we use bandpass taps instead of lowpass taps
     in order to remove the subaudible tone woobling <250Hz. We also use a
     pfb_arb_resampler instead of the usual decimating filter to get
     arbitrary sample rate output. This way we don't have to immediately
     follow the fm_demod with a resampler to get to whatever audio rate.
+    It also incorporates a noise squelch.
     """
-    def __init__(self, rate, decim):
+    def __init__(self, rate, decim, gate=False):
         gr.hier_block2.__init__(self,
                                 "fm_demod",
                                 gr.io_signature(1,1,gr.sizeof_gr_complex),
@@ -47,19 +49,21 @@ class fm_demod(gr.hier_block2):
         tau=75.e-6
         deviation = 5.e3
         k=rate/(2*pi*deviation)
-        quad = analog.quadrature_demod_cf(k)
-        deemph = fm_deemph(rate, tau)
-        nfilts = 32
-        audio_taps = filter.optfir.band_pass(nfilts, #gain
-                                            rate*nfilts, #rate
-                                            250,  #stopband_lo
-                                            300,  #passband_lo
-                                            3000, #passband_hi
-                                            4500, #stopband_hi
-                                            0.2,  #passband ripple
-                                            60)   #stopband atten
-        resamp = filter.pfb_arb_resampler_cf(1./decim, audio_taps)
-        self.connect(self, quad, deemph, resamp, self)
+        self.rate = rate
+        self.quad = analog.quadrature_demod_cf(k)
+        self.squelch = scanner.standard_squelch_ff(gate=gate)
+        self.deemph = fm_deemph(rate, tau)
+        self.nfilts = 32
+        audio_taps = optfir.band_pass(self.nfilts,
+                                      self.rate*self.nfilts,
+                                      250,
+                                      300,
+                                      3000,
+                                      4000,
+                                      0.2,
+                                      40)
+        self.resamp = pfb.arb_resampler_fff(1./decim, audio_taps)
+        self.connect(self, self.quad, self.squelch, self.deemph, self.resamp, self)
 
 class filterbank(gr.hier_block2):
     def __init__(self, rate, channel_spacing):
@@ -70,12 +74,14 @@ class filterbank(gr.hier_block2):
                                 gr.io_signature(numchans,numchans,gr.sizeof_gr_complex))
         self._channel_spacing = channel_spacing
         self._rate = rate
-        self._bank = pfb.channelizer_ccf(numchans)
+        self._bank = pfb.channelizer_ccf(numchans, atten=60)
+        print "Filterbank using %i channels" % numchans
+        print "Filterbank filter length per channel: %i" % len(self._bank.pfb.taps()[0])
         self._map = [0]*numchans
         self._bank.set_channel_map(self._map)
         self.connect(self, self._bank)
         for i in xrange(numchans):
-            self.connect(self._bank, (self,i))
+            self.connect((self._bank,i), (self,i))
 
     def set_freq(self, chan, offset):
         assert(offset % self._channel_spacing < 1e-4)
@@ -86,6 +92,14 @@ class filterbank(gr.hier_block2):
         self._bank.set_channel_map(self._map)
 
 class wavsink_path(gr.hier_block2):
+    """
+    Gated squelch FM demod and file sink.
+    TODO: 
+        Figure out how to set file, 
+        handle close/open, 
+        handle appending, 
+        maybe don't use .wav at all but sql.
+    """
     def __init__(self, rate, filename, squelch):
         gr.hier_block2.__init__(self,
                                 "logging_receiver",
@@ -96,41 +110,28 @@ class wavsink_path(gr.hier_block2):
         self._squelch = squelch
         self._audiorate = 8000
         self._decim = float(self._rate) / self._audiorate
-        self._squelch = analog.pwr_squelch_cc(squelch,
-                                            alpha = 0.1, #wat
-                                            ramp = 10, #wat
-                                            gate = False)
         self._demod = fm_demod(self._rate, #rate
-                               self._decim) #audio decimation
+                               self._decim, #audio decimation
+                               True) #gate samples when closed?
         self._valve = blks2.valve(gr.sizeof_float, False)
         self._audiosink = blocks.wavfile_sink(self._filename, 1, self._audiorate, 8)
-        self.connect(self, self._decim, self._squelch, self._demod, self._valve, self._audiosink)
+        self.connect(self, self._demod, self._valve, self._audiosink)
 
     def enable(self, enable):
         """
-        open the valve and allow recording to the wavfile (assuming enough pwr for pwr squelch to open)
+        open the valve and allow recording to the wavfile (assuming signal for squelch to open)
+        note: blks2.valve curiously calls an "open" squelch one that is blocked: like a switch instead
+        of a valve. so we invert.
         """
         self._valve.set_open(not enable)
     def mute(self):
         self.enable(False)
     def unmute(self):
         self.enable(True)
+    def squelch_open(self):
+        return self._squelch.unmuted()
 
-class logging_receiver(gr.hier_block2):
-    def __init__(self, rate, nchans):
-        gr.hier_block2.__init__(self,
-                                "logging_receiver",
-                                gr.io_signature(nchans, nchans, gr.sizeof_gr_complex),
-                                gr.io_signature(0,0,0))
-
-        self._rate = rate
-        self._nchans = nchans
-        self._recorders = []
-        self._squelch = -50 #TODO PARAMETERIZE
-        for i in xrange(nchans):
-            self._recorders.append(wavsink_path(rate, "how do i filename", self._squelch)) #TODO FILENAME
-            self.connect((self, i), self._recorders[-1])
-
+#TODO assign subscribers
 class trunked_feed(gr.hier_block2, pubsub):
     def __init__(self, options, nchans=16):
         gr.hier_block2.__init__(self,
@@ -195,7 +196,7 @@ class trunked_feed(gr.hier_block2, pubsub):
                 src = blocks.udp_source(gr.sizeof_gr_complex, ip, int(port))
                 print "Using UDP source %s:%s" % (ip, port)
             else:
-                src = blocks.file_source(gr.sizeof_gr_complex, options.source)
+                src = blocks.file_source(gr.sizeof_gr_complex, options.source, repeat=False)
                 print "Using file source %s" % options.source
 
         channel_spacing = 25e3
@@ -204,8 +205,8 @@ class trunked_feed(gr.hier_block2, pubsub):
                                         channel_spacing=channel_spacing) #TODO parameterize
 
         self.connect(src, self._filter_bank)
-        for i in xrange(self._nchans)
-            self.connect((self._filter_bank,i), (self, n))
+        for i in xrange(self._nchans):
+            self.connect((self._filter_bank,i), (self, i))
 
         self._data_src = src
         self._source_name = options.source

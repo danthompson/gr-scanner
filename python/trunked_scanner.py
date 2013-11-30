@@ -34,6 +34,9 @@ class trunked_scanner(gr.top_block, pubsub):
 
         self._tg_assignments[addr] = freq
 
+    def close(self):
+        self._feed.close()
+
     @staticmethod
     def add_options(parser):
         scanner.trunked_feed.add_options(parser)

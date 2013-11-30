@@ -49,8 +49,9 @@ from audio import audio_path
 from ctrl_chan import smartnet_ctrl_rx, edacs_ctrl_rx
 from edacs_parse import edacs_pkt
 from fsk_demod import fsk_demod
-from radio import trunked_feed
+from radio import trunked_feed, fm_demod
 from trunked_scanner import trunked_scanner
+from standard_squelch_ff import standard_squelch_ff
 
 # ----------------------------------------------------------------
 # Tail of workaround
